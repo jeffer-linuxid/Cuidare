@@ -205,3 +205,5 @@ O executável produzido por este projeto não tem assinatura digital e pode ser 
 Datas aceitam `AAAA-MM-DD` ou `DD/MM/AAAA`; horários aceitam `HH:MM` ou `HH:MM:SS`; disponibilidade aceita verdadeiro/verdadeira, falso/falsa, sim/não, yes/no e 1/0, além de vazio, `null` ou `nulo` para indicar que não foi informada.
 
 O campo de paciente é apenas um nome opcional associado ao registro; ainda não há cadastro separado de pacientes, escalas de atendimento por paciente, detecção automática de furos ou contas individuais.
+#   C u i d a r e  
+ 
