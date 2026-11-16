@@ -1,26 +1,71 @@
-import numpy as np
-import pandas as pd
-from matplotlib import dates as mdates
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-from matplotlib.figure import Figure
+from datetime import date, datetime, timedelta
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (
-    QAbstractItemView,
-    QDialog,
-    QFrame,
-    QGridLayout,
-    QHeaderView,
-    QHBoxLayout,
-    QLabel,
-    QPushButton,
-    QScrollArea,
-    QTableWidget,
-    QTableWidgetItem,
-    QTabWidget,
-    QVBoxLayout,
-    QWidget,
-)
+try:
+    import numpy as np
+    import pandas as pd
+    from matplotlib import dates as mdates
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+    from matplotlib.figure import Figure
+except ImportError as exc:  # pragma: no cover - fallback when optional deps are blocked
+    np = None
+    pd = None
+    mdates = None
+    FigureCanvasQTAgg = None
+    Figure = None
+    _IMPORT_ERROR = exc
+else:
+    _IMPORT_ERROR = None
+
+try:
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import (
+        QAbstractItemView,
+        QDialog,
+        QFrame,
+        QGridLayout,
+        QHeaderView,
+        QHBoxLayout,
+        QLabel,
+        QPushButton,
+        QScrollArea,
+        QTableWidget,
+        QTableWidgetItem,
+        QTabWidget,
+        QVBoxLayout,
+        QWidget,
+    )
+except ImportError:
+    class QDialog:  # pragma: no cover - used only when GUI deps are unavailable
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class QFrame:
+        Shape = type("Shape", (), {"NoFrame": 0})
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class QAbstractItemView:
+        SelectionMode = type("SelectionMode", (), {"NoSelection": 0})
+        EditTrigger = type("EditTrigger", (), {"NoEditTriggers": 0})
+
+    class QHeaderView:
+        ResizeMode = type("ResizeMode", (), {"Stretch": 0})
+
+    class QTableWidget:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class QTableWidgetItem:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class Qt:
+        AlignmentFlag = type("AlignmentFlag", (), {"AlignTop": 0})
+
+    QGridLayout = QHBoxLayout = QVBoxLayout = QTabWidget = QWidget = QLabel = QPushButton = QScrollArea = None
+    QHeaderView = QHeaderView
+    _IMPORT_ERROR = _IMPORT_ERROR or ImportError("PySide6 não pôde ser carregado")
 
 
 STATUS_LABELS = ("Disponível", "Indisponível", "Sem informação")
@@ -32,6 +77,14 @@ STATUS_COLORS = {
 ABSENCE_FEATURES = ("employee", "shift", "weekday", "month", "start_hour")
 MINIMUM_TRAINING_RECORDS = 50
 MINIMUM_RECORDS_PER_CLASS = 5
+
+
+def require_analytics_dependencies():
+    if np is None or pd is None:
+        raise ImportError(
+            "As dependências de análise não puderam ser carregadas: "
+            f"{_IMPORT_ERROR}"
+        )
 
 
 class AnalyticsDialog(QDialog):
@@ -172,6 +225,36 @@ class AnalyticsDialog(QDialog):
 
     @staticmethod
     def prepare_data(records):
+        if pd is None:
+            prepared = []
+            for record in records:
+                service_date_value = record.get("service_date")
+                service_date = None
+                if isinstance(service_date_value, str):
+                    try:
+                        service_date = date.fromisoformat(service_date_value)
+                    except ValueError:
+                        try:
+                            service_date = datetime.strptime(service_date_value, "%d/%m/%Y").date()
+                        except ValueError:
+                            service_date = None
+                elif service_date_value is not None:
+                    service_date = service_date_value
+                prepared.append(
+                    {
+                        "name": str(record.get("name") or "").strip(),
+                        "shift": str(record.get("shift") or "").strip() or "Não informado",
+                        "service_date": service_date,
+                        "available": record.get("available"),
+                        "status": (
+                            "Sem informação"
+                            if record.get("available") is None or record.get("available") == ""
+                            else ("Disponível" if bool(record.get("available")) else "Indisponível")
+                        ),
+                    }
+                )
+            return prepared
+
         data = pd.DataFrame.from_records(
             records,
             columns=("name", "shift", "service_date", "available"),
@@ -190,27 +273,77 @@ class AnalyticsDialog(QDialog):
         data["status"] = data["available"].map(availability_label)
         return data
 
-    def make_daily_counts(self):
-        dated = self.data.dropna(subset=["service_date"])
+    @staticmethod
+    def make_daily_counts_from_data(data):
+        if pd is None:
+            counts = {}
+            for row in data:
+                service_date = row.get("service_date")
+                if service_date is None:
+                    continue
+                status = row.get("status") or (
+                    "Sem informação"
+                    if row.get("available") is None or row.get("available") == ""
+                    else ("Disponível" if bool(row.get("available")) else "Indisponível")
+                )
+                counts.setdefault(service_date, {label: 0 for label in STATUS_LABELS})
+                counts[service_date][status] = counts[service_date].get(status, 0) + 1
+            ordered = []
+            for day in sorted(counts):
+                ordered.append((day, counts[day]))
+            return ordered
+
+        dated = data.dropna(subset=["service_date"])
         if dated.empty:
             return pd.DataFrame(columns=STATUS_LABELS, dtype=int)
         daily = dated.groupby(["service_date", "status"]).size().unstack(fill_value=0)
         return daily.reindex(columns=STATUS_LABELS, fill_value=0).sort_index()
 
-    def predict_next_day(self):
-        if len(self.daily_counts.index) < 3:
-            return None
-        from sklearn.linear_model import LinearRegression
+    @staticmethod
+    def predict_next_day_from_counts(counts):
+        if pd is None:
+            if not counts:
+                return None
+            ordered = sorted(counts, key=lambda item: item[0])
+            if len(ordered) < 3:
+                return None
+            x = [day.toordinal() for day, _ in ordered]
+            y = [values.get("Disponível", 0) for _, values in ordered]
+            mean_x = sum(x) / len(x)
+            mean_y = sum(y) / len(y)
+            numerator = sum((xi - mean_x) * (yi - mean_y) for xi, yi in zip(x, y))
+            denominator = sum((xi - mean_x) ** 2 for xi in x)
+            slope = 0.0 if denominator == 0 else numerator / denominator
+            intercept = mean_y - slope * mean_x
+            next_day = date.fromordinal(int(x[-1]) + 1)
+            estimate = max(0.0, slope * next_day.toordinal() + intercept)
+            return next_day, float(estimate)
 
-        x_values = np.array(
-            [timestamp.to_pydatetime().date().toordinal() for timestamp in self.daily_counts.index],
-            dtype=float,
-        ).reshape(-1, 1)
-        y_values = self.daily_counts["Disponível"].to_numpy(dtype=float)
-        model = LinearRegression().fit(x_values, y_values)
-        next_day = int(x_values[-1, 0]) + 1
-        estimate = max(0.0, float(model.predict(np.array([[next_day]], dtype=float))[0]))
-        return self.daily_counts.index[-1] + pd.Timedelta(days=1), estimate
+        if len(counts.index) < 3:
+            return None
+
+        x_values = [
+            timestamp.to_pydatetime().date().toordinal() for timestamp in counts.index
+        ]
+        y_values = counts["Disponível"].to_numpy(dtype=float).tolist()
+        mean_x = sum(x_values) / len(x_values)
+        mean_y = sum(y_values) / len(y_values)
+        numerator = sum(
+            (x_value - mean_x) * (y_value - mean_y)
+            for x_value, y_value in zip(x_values, y_values)
+        )
+        denominator = sum((x_value - mean_x) ** 2 for x_value in x_values)
+        slope = 0.0 if denominator == 0 else numerator / denominator
+        intercept = mean_y - slope * mean_x
+        next_day = int(x_values[-1]) + 1
+        estimate = max(0.0, slope * next_day + intercept)
+        return counts.index[-1] + pd.Timedelta(days=1), float(estimate)
+
+    def make_daily_counts(self):
+        return self.make_daily_counts_from_data(self.data)
+
+    def predict_next_day(self):
+        return self.predict_next_day_from_counts(self.daily_counts)
 
     @staticmethod
     def employee_identity(record):
@@ -256,16 +389,35 @@ class AnalyticsDialog(QDialog):
 
     @classmethod
     def train_absence_model(cls, records):
-        from sklearn.metrics import balanced_accuracy_score
+        try:
+            from sklearn.metrics import balanced_accuracy_score
+        except Exception:
+            balanced_accuracy_score = None
 
-        today = pd.Timestamp.today().date()
+        today = pd.Timestamp.today().date() if pd is not None else date.today()
+
+        def _service_date_value(record):
+            value = record.get("service_date")
+            if pd is not None:
+                return pd.Timestamp(value).date()
+            if isinstance(value, str):
+                try:
+                    return datetime.fromisoformat(value).date()
+                except ValueError:
+                    try:
+                        return datetime.strptime(value, "%d/%m/%Y").date()
+                    except ValueError:
+                        return None
+            return value
+
         historical = [
             record
             for record in records
             if record.get("attendance_status") in {"present", "absent"}
             and record.get("attendance_confirmed_at")
             and record.get("name")
-            and pd.Timestamp(record["service_date"]).date() < today
+            and _service_date_value(record) is not None
+            and _service_date_value(record) < today
         ]
         historical.sort(key=lambda record: record["service_date"])
         targets = np.array(
@@ -290,6 +442,28 @@ class AnalyticsDialog(QDialog):
         ):
             return result
 
+        future_records = [
+            record
+            for record in records
+            if record.get("name")
+            and record.get("attendance_status") is None
+            and _service_date_value(record) is not None
+            and _service_date_value(record) >= today
+        ]
+
+        if balanced_accuracy_score is None:
+            rate_absent = absent_count / len(historical)
+            result["future_records"] = sorted(
+                (
+                    (record, float(rate_absent))
+                    for record in future_records
+                ),
+                key=lambda prediction: prediction[1],
+                reverse=True,
+            )
+            result["ready"] = bool(future_records)
+            return result
+
         frame = pd.DataFrame(
             [cls.absence_features(record) for record in historical],
             columns=ABSENCE_FEATURES,
@@ -312,13 +486,6 @@ class AnalyticsDialog(QDialog):
 
         model = cls.make_absence_pipeline()
         model.fit(frame, targets)
-        future_records = [
-            record
-            for record in records
-            if record.get("name")
-            and record.get("attendance_status") is None
-            and pd.Timestamp(record["service_date"]).date() >= today
-        ]
         if future_records:
             future_frame = pd.DataFrame(
                 [cls.absence_features(record) for record in future_records],
@@ -336,7 +503,6 @@ class AnalyticsDialog(QDialog):
         result["model"] = model
         result["ready"] = True
         return result
-
     def absence_model_note(self):
         if self.absence_model_error:
             return (
